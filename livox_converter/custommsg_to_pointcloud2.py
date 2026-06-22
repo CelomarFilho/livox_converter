@@ -6,19 +6,25 @@ Converte livox_ros_driver2/CustomMsg  ->  sensor_msgs/PointCloud2
 no formato PointXYZRTLT (x, y, z, intensity, tag, line, timestamp),
 exatamente o mesmo que o driver publica quando xfer_format = 0.
 
-É o caminho inverso do pointCloud_converter2.py.
+E o caminho inverso do pointCloud_converter2.py.
 
-Vantagem: o timestamp de cada ponto é reconstruido a partir de
+Vantagem: o timestamp de cada ponto e reconstruido a partir de
 timebase + offset_time. Assim NAO se perde a informacao de tempo
 individual de cada ponto (que no Mid-360 o PointCloud2 do driver
 costuma "achatar" para um unico valor por frame). Nenhum dado do
 CustomMsg e descartado.
+
+QoS: por padrao assina e publica em BEST_EFFORT, que e o esperado para
+dado de sensor (e o que o kiss_icp_node assina). Um assinante best-effort
+recebe de publicador reliable E best-effort, entao funciona com qualquer
+config do driver. Parametros permitem mudar isso.
 """
 
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import PointCloud2, PointField
 from livox_ros_driver2.msg import CustomMsg
@@ -48,6 +54,16 @@ _DTYPE = np.dtype({
 })
 
 
+def _make_qos(reliability):
+    rel = (ReliabilityPolicy.RELIABLE if reliability == 'reliable'
+           else ReliabilityPolicy.BEST_EFFORT)
+    return QoSProfile(
+        reliability=rel,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
+    )
+
+
 class CustomMsgToPointCloud2(Node):
     def __init__(self):
         super().__init__('custommsg_to_pointcloud2')
@@ -60,19 +76,29 @@ class CustomMsgToPointCloud2(Node):
         # 'relative_s'  -> apenas offset_time, em segundos (varios SLAMs usam isso)
         self.declare_parameter('timestamp_mode', 'absolute_ns')
 
+        # QoS:
+        #   sub_reliability: 'best_effort' (default) ou 'reliable'
+        #   pub_reliability: 'best_effort' (default), 'reliable', ou 'match_input'
+        #                    ('match_input' = publica com o mesmo QoS do assinante)
+        self.declare_parameter('sub_reliability', 'best_effort')
+        self.declare_parameter('pub_reliability', 'best_effort')
+
         in_topic = self.get_parameter('input_topic').value
         out_topic = self.get_parameter('output_topic').value
         self.ts_mode = self.get_parameter('timestamp_mode').value
+        sub_rel = self.get_parameter('sub_reliability').value
+        pub_rel = self.get_parameter('pub_reliability').value
+        if pub_rel == 'match_input':
+            pub_rel = sub_rel
 
-        # depth 10 padrao (reliable) - mesmo QoS do seu conversor que ja funciona.
-        # Se nao chegar nenhum dado, o driver pode estar publicando em sensor-data
-        # QoS (best-effort); nesse caso troque para um QoSProfile best_effort.
-        self.sub = self.create_subscription(CustomMsg, in_topic, self.callback, 10)
-        self.pub = self.create_publisher(PointCloud2, out_topic, 10)
+        self.sub = self.create_subscription(
+            CustomMsg, in_topic, self.callback, _make_qos(sub_rel))
+        self.pub = self.create_publisher(
+            PointCloud2, out_topic, _make_qos(pub_rel))
 
         self.get_logger().info(
-            f'Convertendo {in_topic} (CustomMsg) -> {out_topic} (PointCloud2), '
-            f'timestamp_mode={self.ts_mode}')
+            f'Convertendo {in_topic} (CustomMsg, {sub_rel}) -> '
+            f'{out_topic} (PointCloud2, {pub_rel}), timestamp_mode={self.ts_mode}')
 
     def callback(self, msg: CustomMsg):
         pts = msg.points
